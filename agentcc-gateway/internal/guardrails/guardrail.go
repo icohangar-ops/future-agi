@@ -26,7 +26,17 @@ const (
 	ActionWarn
 	// ActionLog records the result without affecting the request.
 	ActionLog
+	// ActionEscalate holds the call for a person. The gateway does not run
+	// the tool call; the client receives approval_required instead.
+	ActionEscalate
 )
+
+// Staged is implemented by a guardrail that has to see more than one stage.
+// Org checks consult it. A guardrail that only implements Guardrail runs on
+// the single stage from Stage().
+type Staged interface {
+	Stages() []Stage
+}
 
 // CheckInput is the input to a guardrail check.
 type CheckInput struct {
@@ -66,6 +76,7 @@ type TriggeredGuardrail struct {
 // PipelineResult is the aggregate result of running all guardrails in a stage.
 type PipelineResult struct {
 	Blocked   bool
+	Escalated bool
 	Warnings  []string
 	Triggered []TriggeredGuardrail
 }

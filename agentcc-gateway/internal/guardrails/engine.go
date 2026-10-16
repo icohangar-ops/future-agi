@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/futureagi/agentcc-gateway/internal/config"
@@ -68,6 +69,10 @@ func NewEngine(cfg config.GuardrailsConfig, registry map[string]Guardrail) *Engi
 		case "pre":
 			e.preGuardrails = append(e.preGuardrails, resolved)
 		case "post":
+			e.postGuardrails = append(e.postGuardrails, resolved)
+		case "both":
+			// Argument checks have to see a pending call and the model's reply.
+			e.preGuardrails = append(e.preGuardrails, resolved)
 			e.postGuardrails = append(e.postGuardrails, resolved)
 		default:
 			slog.Warn("unknown guardrail stage, skipping",
@@ -159,6 +164,16 @@ func (e *Engine) run(ctx context.Context, rules []resolvedRule, input *CheckInpu
 			continue
 		}
 
+		effectiveAction = resolveGuardrailAction(effectiveAction, checkResult)
+		// A strict request policy still blocks. Log-only still only logs.
+		// Applied again so an escalate verdict cannot soften them.
+		switch rp {
+		case policy.RequestPolicyLogOnly:
+			effectiveAction = ActionLog
+		case policy.RequestPolicyStrict:
+			effectiveAction = ActionBlock
+		}
+
 		tg := TriggeredGuardrail{
 			Name:      rule.guardrail.Name(),
 			Score:     checkResult.Score,
@@ -172,6 +187,9 @@ func (e *Engine) run(ctx context.Context, rules []resolvedRule, input *CheckInpu
 		case ActionBlock:
 			result.Blocked = true
 			return result // Short-circuit on block.
+		case ActionEscalate:
+			result.Escalated = true
+			return result // Hold for a person; do not run the tool call.
 		case ActionWarn:
 			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %s", rule.guardrail.Name(), checkResult.Message))
 		case ActionLog:
@@ -291,16 +309,39 @@ func (e *Engine) handleError(rule resolvedRule, err error) *CheckResult {
 }
 
 func parseAction(s string) Action {
-	switch s {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "block":
 		return ActionBlock
 	case "warn":
 		return ActionWarn
 	case "log":
 		return ActionLog
+	case "escalate", "approval":
+		return ActionEscalate
 	default:
 		return ActionLog
 	}
+}
+
+// resolveGuardrailAction lets a check report escalate from its own result.
+// Log and warn stay as the operator set them. A block action is replaced
+// when the check itself says the call needs a person.
+func resolveGuardrailAction(configured Action, cr *CheckResult) Action {
+	if configured == ActionLog || configured == ActionWarn {
+		return configured
+	}
+	if cr != nil && cr.Action == ActionEscalate {
+		return ActionEscalate
+	}
+	if cr != nil && cr.Details != nil {
+		if verdict, _ := cr.Details["verdict"].(string); verdict == "escalate" {
+			return ActionEscalate
+		}
+	}
+	if configured == ActionEscalate {
+		return ActionEscalate
+	}
+	return configured
 }
 
 // HasRule returns true if the engine has a static rule with the given name.

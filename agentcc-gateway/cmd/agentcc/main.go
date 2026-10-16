@@ -18,6 +18,7 @@ import (
 	"github.com/futureagi/agentcc-gateway/internal/cache"
 	"github.com/futureagi/agentcc-gateway/internal/config"
 	"github.com/futureagi/agentcc-gateway/internal/guardrails"
+	"github.com/futureagi/agentcc-gateway/internal/guardrails/approval"
 	"github.com/futureagi/agentcc-gateway/internal/guardrails/blocklist"
 	"github.com/futureagi/agentcc-gateway/internal/guardrails/contentmod"
 	"github.com/futureagi/agentcc-gateway/internal/guardrails/expression"
@@ -284,6 +285,9 @@ func main() {
 			} else if toolperm.IsToolPermConfig(rule.Config) {
 				guardrailRegistry[rule.Name] = toolperm.New(rule.Name, rule.Config)
 				slog.Info("registered tool permission guardrail", "name", rule.Name)
+			} else if approval.IsApprovalConfig(rule.Config) {
+				guardrailRegistry[rule.Name] = approval.New(rule.Name, rule.Config)
+				slog.Info("registered argument approval guardrail", "name", rule.Name)
 			} else if mcpsec.IsMCPSecConfig(rule.Config) {
 				guardrailRegistry[rule.Name] = mcpsec.New(rule.Name, rule.Config)
 				slog.Info("registered MCP security guardrail", "name", rule.Name)
@@ -345,6 +349,9 @@ func main() {
 			}
 			if toolperm.IsToolPermConfig(cfg) {
 				return toolperm.New(name, cfg)
+			}
+			if approval.IsApprovalConfig(cfg) {
+				return approval.New(name, cfg)
 			}
 			if mcpsec.IsMCPSecConfig(cfg) {
 				return mcpsec.New(name, cfg)

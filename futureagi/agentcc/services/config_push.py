@@ -56,6 +56,7 @@ _RULE_PROVIDER_DEFAULTS = {
     "crowdstrike-aidr": "crowdstrike",
     "zscaler-guard": "zscaler",
     "tool-permissions": "tool_permissions",
+    "argument-approval": "approval",
     "mcp-security": "mcp_security",
 }
 

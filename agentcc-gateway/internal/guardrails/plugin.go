@@ -113,6 +113,9 @@ func (p *GuardrailPlugin) ProcessResponse(ctx context.Context, rc *models.Reques
 				p.buildBlockMessage(result),
 			))
 		}
+		if held := p.holdForApproval(rc, result, true); held != nil {
+			return *held
+		}
 
 		p.applyMetadata(rc, result)
 	}
@@ -161,8 +164,10 @@ func (p *GuardrailPlugin) runOrgGuardrails(ctx context.Context, rc *models.Reque
 			continue
 		}
 
-		// Check stage matches.
-		if g.Stage() != stage {
+		// Check stage matches. A guardrail that implements Staged runs on
+		// every stage it lists, so an argument check can see both the
+		// pending call on the request and the model's new tool call.
+		if !runsOnStage(g, stage) {
 			continue
 		}
 
@@ -194,7 +199,7 @@ func (p *GuardrailPlugin) runOrgGuardrails(ctx context.Context, rc *models.Reque
 			continue
 		}
 
-		action := parseAction(check.Action)
+		action := resolveGuardrailAction(parseAction(check.Action), cr)
 
 		tg := TriggeredGuardrail{
 			Name:      name,
@@ -216,6 +221,11 @@ func (p *GuardrailPlugin) runOrgGuardrails(ctx context.Context, rc *models.Reque
 				"content_blocked",
 				p.buildBlockMessage(result),
 			))
+		case ActionEscalate:
+			result.Escalated = true
+			if held := p.holdForApproval(rc, result, stage == StagePost); held != nil {
+				return *held
+			}
 		case ActionWarn:
 			result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %s", name, cr.Message))
 		case ActionLog:
@@ -465,6 +475,9 @@ func (p *GuardrailPlugin) processResult(rc *models.RequestContext, result *Pipel
 			p.buildBlockMessage(result),
 		))
 	}
+	if held := p.holdForApproval(rc, result, false); held != nil {
+		return *held
+	}
 
 	p.applyMetadata(rc, result)
 	return pipeline.ResultContinue()
@@ -513,9 +526,72 @@ func actionString(a Action) string {
 		return "warn"
 	case ActionLog:
 		return "log"
+	case ActionEscalate:
+		return "escalate"
 	default:
 		return "unknown"
 	}
+}
+
+// runsOnStage reports whether g should run for stage.
+func runsOnStage(g Guardrail, stage Stage) bool {
+	if g == nil {
+		return false
+	}
+	if staged, ok := g.(Staged); ok {
+		for _, candidate := range staged.Stages() {
+			if candidate == stage {
+				return true
+			}
+		}
+		return false
+	}
+	return g.Stage() == stage
+}
+
+// holdForApproval stops the pipeline when a guardrail asked for a person.
+// clearResponse drops the model tool call so the client cannot execute it.
+// The returned pointer is nil when nothing needs holding.
+func (p *GuardrailPlugin) holdForApproval(rc *models.RequestContext, result *PipelineResult, clearResponse bool) *pipeline.PluginResult {
+	if result == nil || !result.Escalated {
+		return nil
+	}
+	if clearResponse {
+		rc.Response = nil
+	}
+	rc.Flags.GuardrailTriggered = true
+	name, message := approvalTarget(result)
+	if name != "" {
+		rc.Metadata["guardrail_name"] = name
+	}
+	rc.Metadata["guardrail_action"] = "escalate"
+	rc.Metadata["approval_required"] = "true"
+	storeGuardrailResults(rc, result)
+	held := pipeline.ResultError(models.ErrGuardrailBlocked(
+		"approval_required",
+		p.buildApprovalMessage(name, message),
+	))
+	return &held
+}
+
+func approvalTarget(result *PipelineResult) (string, string) {
+	for _, tg := range result.Triggered {
+		if tg.Action == ActionEscalate {
+			return tg.Name, tg.Message
+		}
+	}
+	if len(result.Triggered) > 0 {
+		tg := result.Triggered[0]
+		return tg.Name, tg.Message
+	}
+	return "", ""
+}
+
+func (p *GuardrailPlugin) buildApprovalMessage(name, message string) string {
+	if name == "" {
+		return "Request needs human approval"
+	}
+	return fmt.Sprintf("Request needs human approval: %s — %s", name, message)
 }
 
 func (p *GuardrailPlugin) buildBlockMessage(result *PipelineResult) string {
