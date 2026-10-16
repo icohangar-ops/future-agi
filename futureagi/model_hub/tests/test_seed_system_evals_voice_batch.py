@@ -1,5 +1,6 @@
-"""Voice-agent system evals (eval_id 209-218) load through the seeder with a
-well-formed judge contract, and tag additions survive the catalog override.
+"""Voice-agent system evals (eval_id 209-218) and the payment-agent policy
+eval (219) load through the seeder with a well-formed judge contract, and
+tag additions survive the catalog override.
 
 A voice agent's conversation can arrive as audio or transcript; these evals use
 the existing Audio chip rather than a separate Voice tag.
@@ -9,7 +10,7 @@ The seeder replaces a YAML's ``eval_tags`` with the entry in
 there, so a tag added only to the YAML of a catalog-listed eval is silently
 dropped at seed time. The override tests pin that the tags land in both.
 
-The ten are also catalog entries, which is what makes the environments harness
+These evals are also catalog entries, which is what makes the environments harness
 offer them; the last tests check that without a database.
 """
 
@@ -39,6 +40,7 @@ NEW_EVALS = {
     216: "call_opening_handling",
     217: "knowledge_gap_handling",
     218: "conversational_naturalness",
+    219: "payment_agent_policy",
 }
 MUSTACHE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 CONSTANT_JS = (
