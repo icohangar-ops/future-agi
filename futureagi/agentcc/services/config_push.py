@@ -55,7 +55,10 @@ _RULE_PROVIDER_DEFAULTS = {
     "lasso-guard": "lasso",
     "crowdstrike-aidr": "crowdstrike",
     "zscaler-guard": "zscaler",
-    "tool-permissions": "tool_permissions",
+    # Gateway recogniser is toolperm.IsToolPermConfig, which matches
+    # "tool_permission". The plural name built nothing, so a dashboard
+    # tool-permissions check never ran (#3230).
+    "tool-permissions": "tool_permission",
     "mcp-security": "mcp_security",
 }
 

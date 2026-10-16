@@ -218,6 +218,11 @@ func TestIsToolPermConfig(t *testing.T) {
 	if !IsToolPermConfig(map[string]interface{}{"provider": "tool_permission"}) {
 		t.Error("should detect tool_permission provider")
 	}
+	// The name the control plane pushed before #3230. A stored org config
+	// still carries it until the next push, so the recogniser has to accept it.
+	if !IsToolPermConfig(map[string]interface{}{"provider": "tool_permissions"}) {
+		t.Error("should detect the historical tool_permissions provider name")
+	}
 	if IsToolPermConfig(map[string]interface{}{"provider": "lakera"}) {
 		t.Error("should not detect lakera as tool_permission")
 	}

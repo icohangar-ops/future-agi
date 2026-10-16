@@ -54,7 +54,7 @@ func New(name string, cfg map[string]interface{}) *ToolPermGuardrail {
 	return g
 }
 
-func (g *ToolPermGuardrail) Name() string           { return g.name }
+func (g *ToolPermGuardrail) Name() string            { return g.name }
 func (g *ToolPermGuardrail) Stage() guardrails.Stage { return guardrails.StagePre }
 
 // IsToolPermConfig returns true if the config specifies a tool permission guardrail.
@@ -63,7 +63,10 @@ func IsToolPermConfig(cfg map[string]interface{}) bool {
 		return false
 	}
 	provider, _ := cfg["provider"].(string)
-	return provider == "tool_permission"
+	// Accept the historical plural name as well. The control plane used to
+	// push "tool_permissions", and a gateway that only matched the singular
+	// dropped those checks until the next config push.
+	return provider == "tool_permission" || provider == "tool_permissions"
 }
 
 // Check evaluates tool names against the permission policy.
