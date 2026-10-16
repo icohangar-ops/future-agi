@@ -168,6 +168,18 @@ func (db *ModelDB) CalculateCost(modelID string, inputTokens, outputTokens int, 
 	return m.Pricing.Calculate(inputTokens, outputTokens, opts), true
 }
 
+// HasPrice reports whether modelID can be metered. It uses the same rule as
+// CalculateCost: a model with no entry, or an entry whose input price is
+// zero, is unpriced. Callers that enforce a spend budget use this so an
+// unknown model is not treated as free.
+func (db *ModelDB) HasPrice(modelID string) bool {
+	if db == nil || modelID == "" {
+		return false
+	}
+	_, ok := db.CalculateCost(modelID, 1, 0, CostOptions{})
+	return ok
+}
+
 // ModelOverride defines config-level overrides for a model entry.
 // Pointer fields are optional — nil means "don't override".
 type ModelOverride struct {

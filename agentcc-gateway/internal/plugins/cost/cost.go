@@ -3,13 +3,19 @@ package cost
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/futureagi/agentcc-gateway/internal/modeldb"
 	"github.com/futureagi/agentcc-gateway/internal/models"
 	"github.com/futureagi/agentcc-gateway/internal/pipeline"
 	"github.com/futureagi/agentcc-gateway/internal/tenant"
 )
+
+// warnedUnpriced logs the first time each unpriced model is seen. Repeating
+// the warning on every request would bury the signal.
+var warnedUnpriced sync.Map
 
 // Plugin is a post-response pipeline plugin that calculates per-request cost.
 type Plugin struct {
@@ -29,8 +35,8 @@ func New(enabled bool, modelDBGetter func() *modeldb.ModelDB, tenantStore *tenan
 	}
 }
 
-func (p *Plugin) Name() string           { return "cost" }
-func (p *Plugin) Priority() int          { return 500 }
+func (p *Plugin) Name() string               { return "cost" }
+func (p *Plugin) Priority() int              { return 500 }
 func (p *Plugin) ShouldSkipOnCacheHit() bool { return true } // No cost to calculate on cache hits.
 
 // ProcessRequest is a no-op for the cost plugin.
@@ -55,7 +61,8 @@ func (p *Plugin) ProcessResponse(_ context.Context, rc *models.RequestContext) p
 		model = rc.Model
 	}
 
-	// Check for per-org custom pricing.
+	// Check for per-org custom pricing. A configured price, including an
+	// explicit zero, means the model is priced and must not be flagged.
 	if p.tenantStore != nil {
 		orgID := rc.Metadata[tenant.MetadataKeyOrgID]
 		if orgID != "" {
@@ -112,9 +119,49 @@ func (p *Plugin) ProcessResponse(_ context.Context, rc *models.RequestContext) p
 			}
 		}
 		rc.Metadata["cost"] = fmt.Sprintf("%.6f", cost)
+		return pipeline.ResultContinue()
+	}
+
+	// Usage we cannot price must not be recorded as $0. Leaving "cost" unset
+	// keeps the numeric field at zero, and pricing_missing tells the request
+	// log that the zero is "no price", not "free".
+	if billableUsage(rc) {
+		markUnpriced(rc, model)
 	}
 
 	return pipeline.ResultContinue()
+}
+
+// billableUsage reports whether this response is one the cost plugin tried
+// to price. Image, speech and rerank are skipped on purpose and are not
+// "unpriced models".
+func billableUsage(rc *models.RequestContext) bool {
+	switch rc.EndpointType {
+	case "image", "speech", "transcription", "rerank":
+		return false
+	case "embedding":
+		return rc.EmbeddingResponse != nil && rc.EmbeddingResponse.Usage != nil
+	default:
+		return rc.Response != nil && rc.Response.Usage != nil
+	}
+}
+
+// markUnpriced flags the request so a later budget check and the request log
+// can tell a missing price from a real zero. It does not invent a cost.
+func markUnpriced(rc *models.RequestContext, model string) {
+	if rc.Metadata == nil {
+		rc.Metadata = map[string]string{}
+	}
+	rc.Metadata["pricing_missing"] = "true"
+	if model != "" {
+		rc.Metadata["pricing_missing_model"] = model
+	}
+	if model == "" {
+		return
+	}
+	if _, loaded := warnedUnpriced.LoadOrStore(model, struct{}{}); !loaded {
+		slog.Warn("model has no price; cost was not recorded", "model", model)
+	}
 }
 
 // tryOrgPricing checks per-org custom pricing for the model.

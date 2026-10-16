@@ -25,15 +25,27 @@ type RedisBudgetBackend interface {
 	Available() bool
 }
 
+// ModelCost prices a completed call from the shared model database.
+// The boolean is false when that model has no price. A zero cost with true
+// means the model is priced and the call happened to cost nothing.
+type ModelCost func(model string, promptTokens, completionTokens int) (float64, bool)
+
 // Plugin enforces hierarchical spend budgets as a pipeline plugin.
 // Priority 90: runs after auth (100) and RBAC (95).
 type Plugin struct {
-	tracker      *budgetpkg.Tracker
-	pricing      *PricingLookup
-	enabled      bool
-	tenantStore  *tenant.Store
-	redisBudget  RedisBudgetBackend // nil = local-only
-	orgCounters  sync.Map           // orgID -> *orgHierarchyCounters
+	tracker     *budgetpkg.Tracker
+	pricing     *PricingLookup
+	enabled     bool
+	tenantStore *tenant.Store
+	redisBudget RedisBudgetBackend // nil = local-only
+	modelCost   ModelCost          // nil = local pricing table only
+	orgCounters sync.Map           // orgID -> *orgHierarchyCounters
+}
+
+// SetModelCost attaches the shared model database. Without it the plugin can
+// only price the small built-in table, and every other model looks free.
+func (p *Plugin) SetModelCost(fn ModelCost) {
+	p.modelCost = fn
 }
 
 // SetRedisBudget attaches a Redis-backed budget store for multi-replica support.
@@ -156,6 +168,26 @@ func (h *orgHierarchyCounters) getOrCreateCounter(level, key string) *orgBudgetC
 
 // ProcessRequest checks all applicable budgets before the provider call.
 func (p *Plugin) ProcessRequest(_ context.Context, rc *models.RequestContext) pipeline.PluginResult {
+	// An unpriced model records $0, so a spend budget would never trip.
+	// Refuse the call while a budget is in force instead of metering it as free.
+	if p.budgetEnforced(rc) {
+		if model, priced := p.lookupPrice(rc); !priced {
+			if rc.Metadata == nil {
+				rc.Metadata = map[string]string{}
+			}
+			rc.Metadata["pricing_missing"] = "true"
+			if model != "" {
+				rc.Metadata["pricing_missing_model"] = model
+			}
+			return pipeline.ResultError(&models.APIError{
+				Status:  http.StatusForbidden,
+				Type:    models.ErrTypePermission,
+				Code:    "pricing_missing",
+				Message: fmt.Sprintf("model %q has no price, so a spend budget cannot meter it", model),
+			})
+		}
+	}
+
 	// Global budget check.
 	if p.enabled && p.tracker != nil {
 		team, user, keyName, model := extractIdentity(rc)
@@ -548,6 +580,12 @@ func (p *Plugin) getOrgHierarchy(orgID string) *orgHierarchyCounters {
 }
 
 func (p *Plugin) calculateCost(rc *models.RequestContext) float64 {
+	// A missing price is not a cost of zero. Recording it would let the
+	// budget treat the call as free.
+	if rc.Metadata["pricing_missing"] == "true" {
+		return 0
+	}
+
 	// Try reading from metadata first (if cost plugin already ran).
 	if costStr := rc.Metadata["cost"]; costStr != "" {
 		if cost, err := strconv.ParseFloat(costStr, 64); err == nil {
@@ -564,23 +602,115 @@ func (p *Plugin) calculateCost(rc *models.RequestContext) float64 {
 	if model == "" {
 		model = rc.Model
 	}
+	prompt := rc.Response.Usage.PromptTokens
+	completion := rc.Response.Usage.CompletionTokens
 
-	if p.pricing == nil {
+	var cost float64
+	ok := false
+	if p.pricing != nil {
+		cost, ok = p.pricing.calculateCost(model, prompt, completion)
+		if !ok && model == rc.ResolvedModel && rc.Model != "" {
+			cost, ok = p.pricing.calculateCost(rc.Model, prompt, completion)
+		}
+	} else if p.modelCost == nil {
 		slog.Warn("budget: no pricing table available")
 		return 0
 	}
-
-	cost, ok := p.pricing.calculateCost(model, rc.Response.Usage.PromptTokens, rc.Response.Usage.CompletionTokens)
-	if !ok {
-		// Try the other model name.
-		if model == rc.ResolvedModel && rc.Model != "" {
-			cost, ok = p.pricing.calculateCost(rc.Model, rc.Response.Usage.PromptTokens, rc.Response.Usage.CompletionTokens)
+	if !ok && p.modelCost != nil {
+		cost, ok = p.modelCost(model, prompt, completion)
+		if !ok && model == rc.ResolvedModel && rc.Model != "" {
+			cost, ok = p.modelCost(rc.Model, prompt, completion)
 		}
 	}
 	if !ok {
+		if rc.Metadata == nil {
+			rc.Metadata = map[string]string{}
+		}
+		rc.Metadata["pricing_missing"] = "true"
+		if model != "" {
+			rc.Metadata["pricing_missing_model"] = model
+		}
 		return 0
 	}
 	return cost
+}
+
+// budgetEnforced reports whether this request is covered by a spend budget.
+// With no budget in force an unpriced model is flagged by the cost plugin
+// and still served.
+func (p *Plugin) budgetEnforced(rc *models.RequestContext) bool {
+	if p.enabled && p.tracker != nil {
+		return true
+	}
+	if p.tenantStore == nil || rc == nil || rc.Metadata == nil {
+		return false
+	}
+	orgID := rc.Metadata[tenant.MetadataKeyOrgID]
+	if orgID == "" {
+		return false
+	}
+	orgCfg := p.tenantStore.Get(orgID)
+	return orgCfg != nil && orgCfg.Budgets != nil && orgCfg.Budgets.Enabled
+}
+
+// lookupPrice reports the model name to meter and whether any candidate has
+// a price. A request with no model name is not blocked here.
+func (p *Plugin) lookupPrice(rc *models.RequestContext) (string, bool) {
+	if rc == nil {
+		return "", true
+	}
+	var candidates []string
+	if rc.ResolvedModel != "" {
+		candidates = append(candidates, rc.ResolvedModel)
+	}
+	if rc.Model != "" && rc.Model != rc.ResolvedModel {
+		candidates = append(candidates, rc.Model)
+	}
+	if len(candidates) == 0 {
+		return "", true
+	}
+	for _, model := range candidates {
+		if p.modelHasPrice(rc, model) {
+			return model, true
+		}
+	}
+	return candidates[0], false
+}
+
+func (p *Plugin) modelHasPrice(rc *models.RequestContext, model string) bool {
+	if model == "" {
+		return false
+	}
+	if p.orgHasCustomPrice(rc, model) {
+		return true
+	}
+	if p.pricing != nil {
+		if _, ok := p.pricing.pricing[model]; ok {
+			return true
+		}
+	}
+	if p.modelCost != nil {
+		if _, ok := p.modelCost(model, 1, 0); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Plugin) orgHasCustomPrice(rc *models.RequestContext, model string) bool {
+	if p.tenantStore == nil || rc == nil || rc.Metadata == nil {
+		return false
+	}
+	orgID := rc.Metadata[tenant.MetadataKeyOrgID]
+	if orgID == "" {
+		return false
+	}
+	orgCfg := p.tenantStore.Get(orgID)
+	if orgCfg == nil || orgCfg.CostTracking == nil || !orgCfg.CostTracking.Enabled {
+		return false
+	}
+	_, ok := orgCfg.CostTracking.CustomPricing[model]
+	return ok
 }
 
 func extractIdentity(rc *models.RequestContext) (team, user, keyName, model string) {
@@ -607,22 +737,22 @@ func extractTags(rc *models.RequestContext) map[string]string {
 
 func defaultPricing() map[string]modelPricing {
 	return map[string]modelPricing{
-		"gpt-4o":                 {inputPerMTok: 2.50, outputPerMTok: 10.00},
-		"gpt-4o-mini":            {inputPerMTok: 0.15, outputPerMTok: 0.60},
-		"gpt-4-turbo":            {inputPerMTok: 10.00, outputPerMTok: 30.00},
-		"gpt-4":                  {inputPerMTok: 30.00, outputPerMTok: 60.00},
-		"gpt-3.5-turbo":          {inputPerMTok: 0.50, outputPerMTok: 1.50},
-		"o1":                     {inputPerMTok: 15.00, outputPerMTok: 60.00},
-		"o1-mini":                {inputPerMTok: 3.00, outputPerMTok: 12.00},
-		"o3-mini":                {inputPerMTok: 1.10, outputPerMTok: 4.40},
-		"claude-3-opus":          {inputPerMTok: 15.00, outputPerMTok: 75.00},
-		"claude-3-sonnet":        {inputPerMTok: 3.00, outputPerMTok: 15.00},
-		"claude-3-haiku":         {inputPerMTok: 0.25, outputPerMTok: 1.25},
-		"claude-3.5-sonnet":      {inputPerMTok: 3.00, outputPerMTok: 15.00},
-		"gemini-1.5-pro":         {inputPerMTok: 1.25, outputPerMTok: 5.00},
-		"gemini-1.5-flash":       {inputPerMTok: 0.075, outputPerMTok: 0.30},
-		"gemini-2.0-flash":       {inputPerMTok: 0.10, outputPerMTok: 0.40},
-		"command-r-plus":         {inputPerMTok: 2.50, outputPerMTok: 10.00},
-		"command-r":              {inputPerMTok: 0.15, outputPerMTok: 0.60},
+		"gpt-4o":            {inputPerMTok: 2.50, outputPerMTok: 10.00},
+		"gpt-4o-mini":       {inputPerMTok: 0.15, outputPerMTok: 0.60},
+		"gpt-4-turbo":       {inputPerMTok: 10.00, outputPerMTok: 30.00},
+		"gpt-4":             {inputPerMTok: 30.00, outputPerMTok: 60.00},
+		"gpt-3.5-turbo":     {inputPerMTok: 0.50, outputPerMTok: 1.50},
+		"o1":                {inputPerMTok: 15.00, outputPerMTok: 60.00},
+		"o1-mini":           {inputPerMTok: 3.00, outputPerMTok: 12.00},
+		"o3-mini":           {inputPerMTok: 1.10, outputPerMTok: 4.40},
+		"claude-3-opus":     {inputPerMTok: 15.00, outputPerMTok: 75.00},
+		"claude-3-sonnet":   {inputPerMTok: 3.00, outputPerMTok: 15.00},
+		"claude-3-haiku":    {inputPerMTok: 0.25, outputPerMTok: 1.25},
+		"claude-3.5-sonnet": {inputPerMTok: 3.00, outputPerMTok: 15.00},
+		"gemini-1.5-pro":    {inputPerMTok: 1.25, outputPerMTok: 5.00},
+		"gemini-1.5-flash":  {inputPerMTok: 0.075, outputPerMTok: 0.30},
+		"gemini-2.0-flash":  {inputPerMTok: 0.10, outputPerMTok: 0.40},
+		"command-r-plus":    {inputPerMTok: 2.50, outputPerMTok: 10.00},
+		"command-r":         {inputPerMTok: 0.15, outputPerMTok: 0.60},
 	}
 }

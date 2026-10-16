@@ -453,6 +453,20 @@ func main() {
 	// Create cost tracking plugin.
 	plugins = append(plugins, costplugin.New(cfg.CostTracking.Enabled, modelDBGetter, tenantStore, cfg.CostTracking.AliasCostFactors))
 
+	// Budgets are created earlier, before the model database exists. Wire the
+	// database in now so a model that is not in the small built-in price
+	// table is metered from the database, and a model in neither is refused
+	// instead of being recorded as $0 (#3445).
+	if budgetPlugin != nil {
+		budgetPlugin.SetModelCost(func(model string, promptTokens, completionTokens int) (float64, bool) {
+			db := modelDBGetter()
+			if db == nil {
+				return 0, false
+			}
+			return db.CalculateCost(model, promptTokens, completionTokens, modeldb.CostOptions{})
+		})
+	}
+
 	// Create credits plugin for managed keys with optional Redis backend.
 	if keyStore != nil {
 		creditsPlugin := creditsplugin.New(true, keyStore)

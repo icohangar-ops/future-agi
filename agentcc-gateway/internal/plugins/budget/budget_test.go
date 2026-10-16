@@ -353,9 +353,9 @@ func TestPerOrg_TeamLevelBlocks(t *testing.T) {
 
 	// Record team spend.
 	rc := makeRC("gpt-4o", "openai", map[string]string{
-		"key_org_id":     "org-1",
-		"key_team":       "engineering",
-		"cost":           "50.00",
+		"key_org_id": "org-1",
+		"key_team":   "engineering",
+		"cost":       "50.00",
 	})
 	rc.Response = &models.ChatCompletionResponse{}
 	p.ProcessResponse(context.Background(), rc)
@@ -444,9 +444,9 @@ func TestPerOrg_TagLevelBlocks(t *testing.T) {
 	p := New(nil, testPricing(), false, store)
 
 	rc := makeRC("gpt-4o", "openai", map[string]string{
-		"key_org_id":   "org-1",
-		"tag:project":  "alpha",
-		"cost":         "20.00",
+		"key_org_id":  "org-1",
+		"tag:project": "alpha",
+		"cost":        "20.00",
 	})
 	rc.Response = &models.ChatCompletionResponse{}
 	p.ProcessResponse(context.Background(), rc)
@@ -546,5 +546,112 @@ func TestPerOrg_UnknownTeamPasses(t *testing.T) {
 	result := p.ProcessRequest(context.Background(), rc)
 	if result.Error != nil {
 		t.Fatalf("unknown team should not be blocked: %s", result.Error.Message)
+	}
+}
+
+func TestUnpricedModel_BlockedWhenBudgetEnabled(t *testing.T) {
+	p := New(testTracker(), testPricing(), true, nil)
+	rc := makeRC("glm-5.3-flash", "anthropic", nil)
+
+	result := p.ProcessRequest(context.Background(), rc)
+	if result.Error == nil {
+		t.Fatal("unpriced model should be blocked while a budget is in force")
+	}
+	if result.Error.Code != "pricing_missing" {
+		t.Fatalf("code = %q, want pricing_missing", result.Error.Code)
+	}
+	if result.Error.Status != 403 {
+		t.Fatalf("status = %d, want 403", result.Error.Status)
+	}
+	if rc.Metadata["pricing_missing"] != "true" {
+		t.Fatalf("pricing_missing = %q", rc.Metadata["pricing_missing"])
+	}
+}
+
+func TestUnpricedModel_NotBlockedWhenBudgetsOff(t *testing.T) {
+	p := New(testTracker(), testPricing(), false, nil)
+	rc := makeRC("glm-5.3-flash", "anthropic", nil)
+
+	result := p.ProcessRequest(context.Background(), rc)
+	if result.Error != nil {
+		t.Fatalf("budgets off should not block an unpriced model: %s", result.Error.Message)
+	}
+}
+
+func TestUnpricedModel_OrgBudgetBlocks(t *testing.T) {
+	store := testTenantStore("org-1", &tenant.BudgetsConfig{
+		Enabled:  true,
+		OrgLimit: 100,
+	})
+	p := New(nil, testPricing(), false, store)
+	rc := makeRC("glm-5.3-flash", "anthropic", map[string]string{
+		"key_org_id": "org-1",
+	})
+
+	result := p.ProcessRequest(context.Background(), rc)
+	if result.Error == nil || result.Error.Code != "pricing_missing" {
+		t.Fatalf("org budget should block an unpriced model, got %#v", result.Error)
+	}
+}
+
+func TestUnpricedModel_OrgCustomPriceAllowed(t *testing.T) {
+	store := tenant.NewStore()
+	store.Set("org-1", &tenant.OrgConfig{
+		Budgets: &tenant.BudgetsConfig{Enabled: true, OrgLimit: 100},
+		CostTracking: &tenant.CostTrackingConfig{
+			Enabled: true,
+			CustomPricing: map[string]*tenant.CustomPricing{
+				"glm-5.3-flash": {InputPerMTok: 0.5, OutputPerMTok: 1.5},
+			},
+		},
+	})
+	p := New(nil, testPricing(), false, store)
+	rc := makeRC("glm-5.3-flash", "anthropic", map[string]string{
+		"key_org_id": "org-1",
+	})
+
+	result := p.ProcessRequest(context.Background(), rc)
+	if result.Error != nil {
+		t.Fatalf("custom price should be meterable: %s", result.Error.Message)
+	}
+}
+
+func TestUnpricedModel_ModelDatabasePriceAllowed(t *testing.T) {
+	p := New(testTracker(), testPricing(), true, nil)
+	p.SetModelCost(func(model string, _, _ int) (float64, bool) {
+		if model == "gpt-4.1" {
+			return 0.01, true
+		}
+		return 0, false
+	})
+
+	priced := makeRC("gpt-4.1", "openai", nil)
+	if result := p.ProcessRequest(context.Background(), priced); result.Error != nil {
+		t.Fatalf("model database price should allow the call: %s", result.Error.Message)
+	}
+
+	missing := makeRC("glm-5.3-flash", "anthropic", nil)
+	result := p.ProcessRequest(context.Background(), missing)
+	if result.Error == nil || result.Error.Code != "pricing_missing" {
+		t.Fatal("model database miss should still block")
+	}
+}
+
+func TestUnpricedModel_ResponseDoesNotRecordZeroSpend(t *testing.T) {
+	tracker := testTracker()
+	p := New(tracker, testPricing(), true, nil)
+	rc := makeRC("glm-5.3-flash", "anthropic", map[string]string{
+		"auth_key_owner":  "alice",
+		"pricing_missing": "true",
+		"cost":            "0.000000",
+	})
+	rc.Response = &models.ChatCompletionResponse{
+		Usage: &models.Usage{PromptTokens: 1000, CompletionTokens: 500},
+	}
+
+	p.ProcessResponse(context.Background(), rc)
+	total, _ := tracker.GetSpend("user", "alice")
+	if total != 0 {
+		t.Fatalf("unpriced traffic recorded spend %f", total)
 	}
 }

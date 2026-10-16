@@ -8,6 +8,7 @@ import (
 	"github.com/futureagi/agentcc-gateway/internal/modeldb"
 	"github.com/futureagi/agentcc-gateway/internal/models"
 	"github.com/futureagi/agentcc-gateway/internal/pipeline"
+	"github.com/futureagi/agentcc-gateway/internal/tenant"
 )
 
 // ---------------------------------------------------------------------------
@@ -363,5 +364,54 @@ func TestProcessResponse_RerankNoCost(t *testing.T) {
 
 	if _, ok := rc.Metadata["cost"]; ok {
 		t.Fatal("Metadata[cost] should not be set for rerank endpoint")
+	}
+}
+
+func TestProcessResponse_UnpricedModelIsFlaggedNotZeroed(t *testing.T) {
+	t.Parallel()
+	p := testPlugin()
+	rc := newRC("glm-5.3-flash", 1000, 500)
+
+	result := p.ProcessResponse(context.Background(), rc)
+	if result.Action != pipeline.Continue {
+		t.Fatalf("ProcessResponse Action = %v, want Continue", result.Action)
+	}
+	if cost, ok := rc.Metadata["cost"]; ok {
+		t.Fatalf("unpriced model recorded cost %q; a missing price must not look like $0", cost)
+	}
+	if rc.Metadata["pricing_missing"] != "true" {
+		t.Fatalf("pricing_missing = %q, want true", rc.Metadata["pricing_missing"])
+	}
+	if rc.Metadata["pricing_missing_model"] != "glm-5.3-flash" {
+		t.Fatalf("pricing_missing_model = %q", rc.Metadata["pricing_missing_model"])
+	}
+}
+
+func TestProcessResponse_OrgCustomPriceIsNotFlagged(t *testing.T) {
+	t.Parallel()
+	db := testDB()
+	store := tenant.NewStore()
+	store.Set("org-1", &tenant.OrgConfig{
+		CostTracking: &tenant.CostTrackingConfig{
+			Enabled: true,
+			CustomPricing: map[string]*tenant.CustomPricing{
+				"glm-5.3-flash": {InputPerMTok: 1, OutputPerMTok: 2},
+			},
+		},
+	})
+	p := New(true, func() *modeldb.ModelDB { return db }, store, nil)
+	rc := newRC("glm-5.3-flash", 1_000_000, 500_000)
+	rc.Metadata[tenant.MetadataKeyOrgID] = "org-1"
+
+	p.ProcessResponse(context.Background(), rc)
+	if rc.Metadata["pricing_missing"] == "true" {
+		t.Fatal("an org custom price must not be flagged missing")
+	}
+	// 1_000_000 * $1/M + 500_000 * $2/M = 1 + 1 = 2
+	if rc.Metadata["cost"] != "2.000000" {
+		t.Fatalf("cost = %q, want 2.000000", rc.Metadata["cost"])
+	}
+	if rc.Metadata["cost_source"] != "org_custom" {
+		t.Fatalf("cost_source = %q", rc.Metadata["cost_source"])
 	}
 }
